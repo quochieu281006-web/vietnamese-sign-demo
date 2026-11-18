@@ -6,6 +6,63 @@ const connections = [[0,1],[1,2],[2,3],[3,4],[0,5],[5,6],[6,7],[7,8],[5,9],[9,10
 const labels = {mu:"Mũ",moc:"Móc",trang:"Trăng",sac:"Sắc",huyen:"Huyền",hoi:"Hỏi",nga:"Ngã",nang:"Nặng",space:"Khoảng cách",del:"Xóa",nothing:"Chưa thấy ký hiệu"};
 let session = "", running = false, starting = false, stream = null, text = "", ready = false;
 let serial = Promise.resolve(), epoch = 0, audio = null, audioUrl = null, speechController = null, reading = false;
+let cameraFacing = "user", switchingCamera = false;
+let processingMode = "browser", handWorker = null, workerRequest = null;
+let pendingSamples = [], upload = null, lastUpload = 0, networkMs = 0;
+function trackerError(value) {const error=new Error(value);error.name="TrackerError";return error;}
+function stopTracker() {
+  handWorker?.terminate(); handWorker=null;
+  if(workerRequest) {clearTimeout(workerRequest.timer);workerRequest.reject(trackerError("Đã dừng xử lý khớp tay."));workerRequest=null;}
+  pendingSamples=[];upload=null;
+}
+function workerCall(data, transfer=[], timeout=30000) {
+  return new Promise((resolve,reject)=>{
+    if(!handWorker || workerRequest) {reject(trackerError("Bộ tìm khớp tay đang bận hoặc đã dừng."));return;}
+    const timer=setTimeout(()=>{workerRequest=null;reject(trackerError("Tải hoặc xử lý khớp tay quá lâu. Thử lại hoặc chọn chế độ Tương thích."));},timeout);
+    workerRequest={resolve,reject,timer};
+    try {handWorker.postMessage(data,transfer);} catch(e) {clearTimeout(timer);workerRequest=null;reject(trackerError(e.message));}
+  });
+}
+async function startTracker() {
+  if(!window.Worker || !window.OffscreenCanvas || !window.createImageBitmap) {
+    throw trackerError("Thiết bị chưa hỗ trợ chế độ Nhanh. Hãy chọn Tương thích hoặc thử trình duyệt mới hơn.");
+  }
+  $("trackingInfo").textContent="Đang tải bộ tìm khớp tay. Lần đầu có thể cần chờ tải mô hình.";
+  handWorker=new Worker("/hand-worker.js");
+  handWorker.onmessage=({data})=>{
+    const waiting=workerRequest;if(!waiting)return;
+    workerRequest=null;clearTimeout(waiting.timer);
+    if(data.type==="error")waiting.reject(trackerError(data.message));else waiting.resolve(data);
+  };
+  handWorker.onerror=()=>{
+    if(workerRequest){const waiting=workerRequest;workerRequest=null;clearTimeout(waiting.timer);waiting.reject(trackerError("Không tải được bộ tìm khớp tay. Kiểm tra tài nguyên web hoặc thử chế độ Tương thích."));}
+  };
+  await workerCall({type:"init"},[],60000);
+}
+function drawLandmarks(landmarks) {
+  ctx.clearRect(0,0,overlay.width,overlay.height);
+  if(!landmarks)return;
+  const points=landmarks.map(([x,y])=>[x*overlay.width,y*overlay.height]);
+  ctx.strokeStyle="#d4ed8c";ctx.lineWidth=3;
+  connections.forEach(([a,b])=>{ctx.beginPath();ctx.moveTo(...points[a]);ctx.lineTo(...points[b]);ctx.stroke();});
+  ctx.fillStyle="#fff";points.forEach(([x,y])=>{ctx.beginPath();ctx.arc(x,y,4,0,Math.PI*2);ctx.fill();});
+}
+function flushSamples(currentEpoch,force=false) {
+  if(upload?.epoch===currentEpoch)return upload.promise;
+  if(!pendingSamples.length || (!force && performance.now()-lastUpload<150))return Promise.resolve();
+  const frames=pendingSamples.splice(0,60);
+  const job={epoch:currentEpoch,promise:null};lastUpload=performance.now();
+  job.promise=enqueue(async()=>{
+    if(!running || currentEpoch!==epoch)return;
+    const begin=performance.now();
+    const result=await (await request("/api/landmarks",JSON.stringify({frames}))).json();
+    if(running && currentEpoch===epoch){networkMs=performance.now()-begin;render(result);}
+  }).catch(async error=>{
+    if(currentEpoch!==epoch)return;
+    await stopCamera();message(`Đã dừng camera. ${error.message}`,true);
+  }).finally(()=>{if(upload===job)upload=null;});
+  upload=job;return job.promise;
+}
 function message(value, error = false) { $("message").textContent = value; $("message").classList.toggle("error", error); }
 function enqueue(job) { const next = serial.then(job); serial = next.catch(() => {}); return next; }
 async function request(path, body, mime = "application/json", signal) {
@@ -18,8 +75,10 @@ async function request(path, body, mime = "application/json", signal) {
   return response;
 }
 function updateButtons() {
-  $("start").disabled = !ready || running || starting;
+  $("start").disabled = !ready || running || starting || switchingCamera;
   $("stop").disabled = !running && !starting;
+  $("cameraFacing").disabled = !ready || starting || switchingCamera;
+  $("processingMode").disabled = !ready || starting || switchingCamera;
   document.querySelectorAll("[data-action]").forEach(b => b.disabled = !ready);
   $("speak").disabled = !ready || !text.trim() || reading;
   $("copy").disabled = !text.trim();
@@ -39,19 +98,17 @@ function render(data, isFrame = false) {
   $("progressText").textContent = `${Math.round(data.progress * 100)}%`;
   $("toneMode").textContent = data.tone_enabled ? "Nhận dấu thanh bằng cử chỉ đang bật. Có thể dùng các nút trên để hỗ trợ." : "Mô hình dấu thanh chưa bật. Dùng các nút hoặc phím 1–5 để thêm dấu.";
   if (isFrame) {
-    ctx.clearRect(0, 0, overlay.width, overlay.height);
-    if (data.landmarks) {
-      const p = data.landmarks.map(([x,y]) => [x * overlay.width,y * overlay.height]);
-      ctx.strokeStyle = "#d4ed8c"; ctx.lineWidth = 3;
-      connections.forEach(([a,b]) => {ctx.beginPath();ctx.moveTo(...p[a]);ctx.lineTo(...p[b]);ctx.stroke();});
-      ctx.fillStyle = "#fff"; p.forEach(([x,y]) => {ctx.beginPath();ctx.arc(x,y,4,0,Math.PI*2);ctx.fill();});
-    }
-    if (data.committed) message(`Đã chốt: ${labels[data.committed] || data.committed.toUpperCase()}. Tiếp tục ký tự mới hoặc nhả tay để nhập lại.`);
+    drawLandmarks(data.landmarks);
   }
+  if (data.committed) message(`Đã chốt: ${labels[data.committed] || data.committed.toUpperCase()}. Tiếp tục ký tự mới hoặc nhả tay để nhập lại.`);
   updateButtons();
 }
 async function action(name) {
   try {
+    if(name!=="pause" && running && processingMode==="browser") {
+      await flushSamples(epoch,true);
+      await flushSamples(epoch,true);
+    }
     await enqueue(async () => render(await (await request("/api/action", JSON.stringify({action:name}))).json()));
     if (name !== "pause") message(name === "clear" ? "Đã xóa văn bản. Bạn có thể bắt đầu ký tự mới." : "Đã cập nhật văn bản đã ghép.");
   }
@@ -59,6 +116,7 @@ async function action(name) {
 }
 async function stopCamera() {
   running = false; starting = false; epoch++;
+  stopTracker();
   if (stream) stream.getTracks().forEach(t => t.stop());
   stream = null; video.srcObject = null;
   ctx.clearRect(0,0,overlay.width,overlay.height);
@@ -73,23 +131,103 @@ async function startCamera() {
   }
   starting = true; const currentEpoch = ++epoch; updateButtons();
   try {
-    const next = await navigator.mediaDevices.getUserMedia({video:{facingMode:"user",width:{ideal:640},height:{ideal:480}},audio:false});
+    if(processingMode==="browser")await startTracker();
+    if(currentEpoch!==epoch)return;
+    // Require the rear camera instead of silently reusing the front one.
+    // Keep a preference for the front so ordinary desktop webcams still work.
+    const facingMode = cameraFacing === "environment" ? {exact:"environment"} : {ideal:"user"};
+    if (cameraFacing === "environment" && !navigator.mediaDevices.getSupportedConstraints?.().facingMode) {
+      const unsupported = new Error("Trình duyệt chưa hỗ trợ chọn camera sau. Hãy thử Chrome hoặc Safari trên điện thoại.");
+      unsupported.name = "CameraSelectionError"; throw unsupported;
+    }
+    const next = await navigator.mediaDevices.getUserMedia({video:{facingMode,width:{ideal:640},height:{ideal:480}},audio:false});
     if (currentEpoch !== epoch) {next.getTracks().forEach(t=>t.stop());return;}
     stream = next; video.srcObject = stream; await video.play();
     if (currentEpoch !== epoch) return;
-    capture.width = Math.min(video.videoWidth,640);
-    capture.height = Math.round(capture.width * video.videoHeight / video.videoWidth);
+    const activeFacing = next.getVideoTracks()[0].getSettings?.().facingMode || cameraFacing;
+    cameraFacing = activeFacing === "environment" ? "environment" : "user";
+    $("cameraFacing").value = cameraFacing;
+    video.parentElement.classList.toggle("rear-camera", cameraFacing === "environment");
+    document.querySelector(".camera-caption").textContent = cameraFacing === "environment" ? "CAMERA SAU · MỘT TAY" : "CAMERA TRƯỚC · HÌNH ẢNH LẬT GƯƠNG";
+    // Also bound portrait video by its longest side on mobile devices.
+    const scale = Math.min(1,640 / Math.max(video.videoWidth,video.videoHeight));
+    capture.width = Math.round(video.videoWidth * scale);
+    capture.height = Math.round(video.videoHeight * scale);
     overlay.width = capture.width; overlay.height = capture.height;
     video.parentElement.style.aspectRatio = `${capture.width}/${capture.height}`;
     running = true; starting = false; $("placeholder").hidden = true; $("cameraState").textContent = "Đang nhận diện";
-    message("Đã bật camera. Giữ một hình tay khoảng 1 giây để chốt ký tự."); updateButtons();
-    stream.getVideoTracks()[0].addEventListener("ended", () => { if (running) stopCamera(); });
-    loop(currentEpoch);
+    message(`Đã bật ${cameraFacing === "environment" ? "camera sau" : "camera trước"}. Giữ một hình tay khoảng 1 giây để chốt ký tự.`); updateButtons();
+    next.getVideoTracks()[0].addEventListener("ended", () => { if (running && stream === next) stopCamera(); });
+    if(processingMode==="browser") {
+      pendingSamples=[];lastUpload=0;networkMs=0;
+      browserLoop(currentEpoch);
+    } else {
+      $("trackingInfo").textContent="Chế độ tương thích gửi ảnh tới máy chủ; nhịp dấu thanh phụ thuộc máy chủ và mạng.";
+      loop(currentEpoch);
+    }
   } catch (e) {
     if (currentEpoch !== epoch) return;
     await stopCamera();
-    const errors = {NotAllowedError:"Bạn chưa cho phép camera. Hãy cấp quyền camera trong trình duyệt rồi thử lại.",NotFoundError:"Không tìm thấy camera trên thiết bị.",NotReadableError:"Không mở được camera. Hãy đóng ứng dụng khác đang dùng webcam."};
-    message(errors[e.name] || `Không bật được camera: ${e.message}`,true);
+    const errors = {NotAllowedError:"Bạn chưa cho phép camera. Hãy cấp quyền camera trong trình duyệt rồi thử lại.",NotFoundError:"Không tìm thấy camera đã chọn. Hãy thử Camera trước hoặc dùng thiết bị khác.",OverconstrainedError:"Thiết bị không có camera phù hợp. Hãy chọn Camera trước hoặc thử trình duyệt khác.",NotReadableError:"Không mở được camera. Hãy đóng ứng dụng khác đang dùng webcam."};
+    message(errors[e.name] || (e.name==="TrackerError" ? e.message : `Không bật được camera: ${e.message}`),true);
+  }
+}
+async function changeCamera() {
+  cameraFacing = $("cameraFacing").value;
+  if (!running) {
+    message(`Đã chọn ${cameraFacing === "environment" ? "camera sau" : "camera trước"}. Nhấn Bật camera để bắt đầu.`);
+    return;
+  }
+  switchingCamera = true;
+  // Release the old track and clear only tracking history, preserving text.
+  const stopped = stopCamera();
+  const switchEpoch = epoch;
+  try {
+    await stopped;
+    if (epoch === switchEpoch && !document.hidden && ready) await startCamera();
+  } finally {
+    switchingCamera = false;
+    updateButtons();
+  }
+}
+async function changeProcessingMode() {
+  processingMode=$("processingMode").value;
+  if(!running) {
+    $("trackingInfo").textContent=processingMode==="browser" ? "Tìm khớp tay trên thiết bị; chỉ gửi tọa độ về máy chủ." : "Gửi ảnh tới máy chủ; có thể chậm trên hosting miễn phí.";
+    return;
+  }
+  switchingCamera=true;
+  const stopped=stopCamera();const switchEpoch=epoch;
+  try {await stopped;if(epoch===switchEpoch && !document.hidden && ready)await startCamera();}
+  finally {switchingCamera=false;updateButtons();}
+}
+async function browserLoop(currentEpoch) {
+  let previousVideoTime=-1,rateSince=performance.now(),count=0,fps=0;
+  while(running && currentEpoch===epoch) {
+    const begin=performance.now();
+    try {
+      if(video.currentTime===previousVideoTime) {await new Promise(resolve=>setTimeout(resolve,10));continue;}
+      previousVideoTime=video.currentTime;
+      const timestamp=performance.now();
+      const bitmap=await createImageBitmap(video);
+      if(!running || currentEpoch!==epoch){bitmap.close();return;}
+      const result=await workerCall({type:"frame",bitmap,timestamp},[bitmap]);
+      if(!running || currentEpoch!==epoch)return;
+      drawLandmarks(result.landmarks);
+      const landmarks=result.landmarks?.map(p=>p.map(n=>Number(n.toFixed(6)))) || null;
+      pendingSamples.push({t:timestamp/1000,landmarks});
+      if(pendingSamples.length>60)throw new Error("Máy chủ hoặc mạng chưa theo kịp chuỗi chuyển động. Hãy thử lại khi kết nối ổn định hoặc dùng nút dấu dự phòng.");
+      // Do not await the upload: joint tracking must keep capturing during RTT.
+      flushSamples(currentEpoch);
+      count++;
+      if(performance.now()-rateSince>=1000){fps=Math.round(count*1000/(performance.now()-rateSince));count=0;rateSince=performance.now();}
+      $("fps").textContent=`${fps||"…"} FPS · trên thiết bị`;
+      $("trackingInfo").textContent=`Khớp tay trên thiết bị${fps ? `: ${fps} FPS` : ""}. Máy chủ: ${Math.round(networkMs)} ms/gói.${fps>0 && fps<8 ? " Nhịp hình thấp, dấu chuyển động có thể khó nhận." : ""}`;
+      await new Promise(resolve=>setTimeout(resolve,Math.max(0,50-(performance.now()-begin))));
+    } catch(error) {
+      if(currentEpoch!==epoch)return;
+      await stopCamera();message(error.message,true);return;
+    }
   }
 }
 async function loop(currentEpoch) {
@@ -110,6 +248,7 @@ async function loop(currentEpoch) {
       $("fps").textContent = `${Math.round(1000/Math.max(elapsed,50))} FPS`;
       await new Promise(resolve => setTimeout(resolve,Math.max(0,50-elapsed)));
     } catch(e) {
+      if (currentEpoch !== epoch) return;
       await stopCamera(); message(`Đã dừng camera. ${e.message}`,true); return;
     }
   }
@@ -148,6 +287,8 @@ async function speak() {
   }
 }
 $("start").onclick = startCamera;
+$("cameraFacing").onchange = changeCamera;
+$("processingMode").onchange = changeProcessingMode;
 $("stop").onclick = async () => {await stopCamera();message("Camera đã dừng. Văn bản vẫn được giữ trong phiên hiện tại.");};
 document.querySelectorAll("[data-action]").forEach(b=>b.onclick=()=>action(b.dataset.action));
 $("speak").onclick=speak; $("cancelSpeech").onclick=cancelSpeech;
@@ -159,6 +300,8 @@ document.addEventListener("keydown", e=>{
 });
 document.addEventListener("visibilitychange",()=>{if(document.hidden && (running||starting)) stopCamera();});
 window.addEventListener("pagehide",()=>{
+  running=false;starting=false;epoch++;
+  stopTracker();
   if(stream) stream.getTracks().forEach(t=>t.stop());cancelSpeech();
   if(session) fetch("/api/close",{method:"POST",headers:{"X-Session":session},body:"",keepalive:true}).catch(()=>{});
 });

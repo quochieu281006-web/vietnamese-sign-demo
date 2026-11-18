@@ -6,6 +6,8 @@ import asyncio
 import io
 import json
 import logging
+import math
+import mimetypes
 import secrets
 import threading
 import time
@@ -53,12 +55,15 @@ def decode_frame(body):
 
 class ClientSession:
     def __init__(self, static_fn, tone_fn):
-        self.core = VietnameseSession(static_fn, tone_fn)
+        self.capture_time = time.monotonic()
+        self.core = VietnameseSession(static_fn, tone_fn, clock=lambda: self.capture_time)
         self.lock = threading.Lock()
         self.last_seen = time.monotonic()
         self.last_frame = 0.0
         self.hands = None
         self.closed = False
+        self.source = None
+        self.last_sample = None
 
     def reset_tracking(self):
         self.core.stab.reset_tracking()
@@ -69,6 +74,8 @@ class ClientSession:
         self.core.status = ""
         self.core.tone_info = ""
         self.last_frame = 0.0
+        self.last_sample = None
+        self.source = None
 
     def snapshot(self, landmarks=None, committed=None):
         text, warnings = self.core.composer(self.core.tokens)
@@ -76,7 +83,58 @@ class ClientSession:
                 "status": self.core.status, "progress": self.core.progress(),
                 "tone_enabled": self.core.tone_fn is not None,
                 "warnings": warnings[-3:], "landmarks": landmarks,
-                "committed": committed}
+                "committed": committed, "tone_info": self.core.tone_info}
+
+    def update_sample(self, lm, timestamp, source):
+        if len(self.core.tokens) >= MAX_TOKENS:
+            raise ClientError("Văn bản đã đầy. Hãy sao chép rồi xóa để tiếp tục.", 409)
+        if self.source != source or (self.last_sample is not None and timestamp - self.last_sample > 0.75):
+            self.reset_tracking()
+        self.source, self.last_sample, self.capture_time = source, timestamp, timestamp
+        return self.core.update(lm)
+
+    def landmarks(self, payload):
+        """Process acquisition timestamps, never HTTP arrival timing.
+
+        A single request can contain multiple captured frames, so a slow network
+        doesn't discard their trajectory or turn a delayed batch into a long hold.
+        """
+        if not isinstance(payload, dict) or not isinstance(payload.get("frames"), list):
+            raise ClientError("Thiếu chuỗi điểm mốc.")
+        frames = payload["frames"]
+        if not 1 <= len(frames) <= 60:
+            raise ClientError("Mỗi gói cần từ 1 đến 60 khung điểm mốc.")
+        samples = []
+        previous = self.last_sample if self.source == "browser" else None
+        for frame in frames:
+            if not isinstance(frame, dict):
+                raise ClientError("Khung điểm mốc không hợp lệ.")
+            timestamp, lm = frame.get("t"), frame.get("landmarks")
+            if (isinstance(timestamp, bool) or not isinstance(timestamp, (int, float))
+                    or not math.isfinite(timestamp) or not 0 <= timestamp <= 1e9):
+                raise ClientError("Thời điểm khung hình không hợp lệ.")
+            if previous is not None and timestamp <= previous:
+                raise ClientError("Khung hình phải tăng theo thời gian.", 409)
+            if lm is not None:
+                try:
+                    lm = np.asarray(lm, dtype=np.float32)
+                except (TypeError, ValueError) as exc:
+                    raise ClientError("Điểm mốc không hợp lệ.") from exc
+                if lm.shape != (21, 3) or not np.isfinite(lm).all() or np.abs(lm).max() > 5:
+                    raise ClientError("Cần 21 điểm mốc hữu hạn, mỗi điểm có x/y/z.")
+            samples.append((float(timestamp), lm))
+            previous = timestamp
+        if samples[-1][0] - samples[0][0] > 5:
+            raise ClientError("Một gói không được dài quá 5 giây.")
+        committed = []
+        for timestamp, lm in samples:
+            token = self.update_sample(lm, timestamp, "browser")
+            if token:
+                committed.append(token)
+        result = self.snapshot(committed=committed[-1] if committed else None)
+        result["committed_tokens"] = committed
+        result["processed_frames"] = len(samples)
+        return result
 
     def frame(self, frame):
         if len(self.core.tokens) >= MAX_TOKENS:
@@ -87,22 +145,19 @@ class ClientSession:
             self.hands = mp.solutions.hands.Hands(
                 static_image_mode=False, max_num_hands=1,
                 min_detection_confidence=0.6, min_tracking_confidence=0.5)
-        now = time.monotonic()
-        if self.last_frame and now - self.last_frame > 0.75:
-            self.reset_tracking()
-        self.last_frame = now
         # Same orientation as vsl_app.py: mirrored pixels, not just mirrored CSS.
         rgb = cv2.cvtColor(cv2.flip(frame, 1), cv2.COLOR_BGR2RGB)
         result = self.hands.process(rgb)
         lm = None
         if result.multi_hand_landmarks:
             lm = np.array([[p.x, p.y, p.z] for p in result.multi_hand_landmarks[0].landmark], np.float32)
-        committed = self.core.update(lm)
+        committed = self.update_sample(lm, time.monotonic(), "server")
         return self.snapshot(None if lm is None else lm.tolist(), committed)
 
     def action(self, action):
         if action == "clear":
             self.core.clear()
+            self.reset_tracking()
         elif action == "backspace":
             self.core.backspace()
         elif action == "pause":
@@ -195,17 +250,17 @@ def handler_for(registry):
             super().setup()
             self.connection.settimeout(30)
 
-        def reply(self, status, body, content_type="application/json; charset=utf-8"):
+        def reply(self, status, body, content_type="application/json; charset=utf-8", cache="no-store"):
             if not isinstance(body, bytes):
                 body = json.dumps(body, ensure_ascii=False).encode("utf-8")
             self.send_response(status)
             self.send_header("Content-Type", content_type)
             self.send_header("Content-Length", str(len(body)))
-            self.send_header("Cache-Control", "no-store")
+            self.send_header("Cache-Control", cache)
             self.send_header("X-Content-Type-Options", "nosniff")
             self.send_header("Referrer-Policy", "same-origin")
             self.send_header("Permissions-Policy", "camera=(self), microphone=()")
-            self.send_header("Content-Security-Policy", "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; media-src 'self' blob:; connect-src 'self'; frame-ancestors 'none'")
+            self.send_header("Content-Security-Policy", "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; worker-src 'self'; style-src 'self'; img-src 'self' data:; media-src 'self' blob:; connect-src 'self'; frame-ancestors 'none'")
             self.end_headers()
             self.wfile.write(body)
 
@@ -216,9 +271,17 @@ def handler_for(registry):
             path = urlsplit(self.path).path
             assets = {"/": ("index.html", "text/html; charset=utf-8"),
                       "/app.js": ("app.js", "text/javascript; charset=utf-8"),
+                      "/hand-worker.js": ("hand-worker.js", "text/javascript; charset=utf-8"),
                       "/style.css": ("style.css", "text/css; charset=utf-8")}
             if path == "/api/health":
                 return self.reply(200, {"ready": True, "tone_enabled": registry.tone_fn is not None})
+            if path.startswith("/vendor/mediapipe/0.10.21/"):
+                asset = (WEB / path.lstrip("/")).resolve()
+                vendor = (WEB / "vendor" / "mediapipe" / "0.10.21").resolve()
+                if not asset.is_relative_to(vendor) or not asset.is_file():
+                    return self.reply(404, {"error": "Không tìm thấy tài nguyên."})
+                mime = {".mjs": "text/javascript", ".wasm": "application/wasm", ".task": "application/octet-stream"}.get(asset.suffix)
+                return self.reply(200, asset.read_bytes(), mime or mimetypes.guess_type(asset.name)[0] or "application/octet-stream", "public, max-age=31536000, immutable")
             if path not in assets:
                 return self.reply(404, {"error": "Không tìm thấy trang."})
             name, mime = assets[path]
@@ -252,6 +315,8 @@ def handler_for(registry):
                         raise ClientError("Phiên đã kết thúc. Hãy tải lại trang.", 401)
                     if path == "/api/frame":
                         return self.reply(200, session.frame(decode_frame(body)))
+                    if path == "/api/landmarks":
+                        return self.reply(200, session.landmarks(json.loads(body)))
                     if path == "/api/action":
                         payload = json.loads(body)
                         if not isinstance(payload, dict) or not isinstance(payload.get("action"), str):
@@ -289,11 +354,8 @@ def main():
     parser.add_argument("--no-tone", action="store_true", help="Chỉ dùng nút thêm dấu thanh")
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO)
-    from mediapipe_runtime import prepare_mediapipe
-    mp = prepare_mediapipe()
-    # Fail before printing the ready URL if graph/model resources are unusable.
-    with mp.solutions.hands.Hands(max_num_hands=1) as _:
-        pass
+    # Browser extracts landmarks by default. Load Python MediaPipe lazily only
+    # for compatibility mode, reducing server startup time and idle memory.
     static, tone = load_static_predictor(), None if args.no_tone else load_tone_predictor()
     # Serialize access to shared estimators; MediaPipe state is per visitor.
     model_lock = threading.Lock()
