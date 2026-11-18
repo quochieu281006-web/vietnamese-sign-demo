@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="vi">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="description" content="Thử nghiệm nhận diện từng ký tự và ghép dấu tiếng Việt bằng webcam.">
+  <title>Chạm chữ · Nhận diện ký tự tiếng Việt</title>
+  <link rel="stylesheet" href="/style.css"><script src="/app.js" defer></script>
+</head>
+<body>
+  <header class="topbar"><a href="/" class="brand"><span class="brand-icon">✳</span> chạm chữ<span class="brand-tag">NGHIÊN CỨU SINH VIÊN</span></a><span class="local-badge"><i></i> Mô hình chạy trên máy chủ local</span></header>
+  <main>
+    <section class="intro"><div><p class="eyebrow">TỪ CỬ CHỈ ĐẾN KÝ TỰ</p><h1>Đưa tay lên.<br><span>Chạm vào tiếng Việt.</span></h1><p class="lead">Nhận diện từng ký tự qua webcam, thêm dấu và nghe văn bản bạn đã ghép.</p></div><aside class="scope-note"><span class="note-icon">↗</span><p><strong>Mỗi lần, một ký tự.</strong><br>Đây là bản thử nghiệm đánh vần và ghép dấu. Hệ thống chưa nhận diện từ hoặc câu liên tục.</p></aside></section>
+    <div id="message" class="message" role="status" aria-live="polite">Đang kết nối mô hình…</div>
+    <section class="workspace" aria-label="Không gian nhận diện">
+      <article class="camera-card"><div class="card-heading"><h2><span class="step">01</span> Camera của bạn</h2><span id="cameraState" class="state">Chưa bật</span></div>
+        <div class="camera-stage"><video id="video" autoplay muted playsinline aria-label="Hình ảnh webcam của bạn"></video><canvas id="overlay" aria-hidden="true"></canvas><div id="placeholder" class="placeholder"><div class="hand-icon">✋</div><h3>Bắt đầu bằng một cử chỉ</h3><p>Đặt một bàn tay trong khung hình,<br>ở nơi đủ sáng và có nền đơn giản.</p></div><span class="camera-caption">MỘT TAY · HÌNH ẢNH LẬT GƯƠNG</span><span id="fps" class="fps"></span></div>
+        <div class="camera-controls"><button id="start" class="primary" disabled>◉ Bật camera</button><button id="stop" class="secondary" disabled>Dừng</button><span>Giữ ký hiệu khoảng 1 giây để chốt.</span></div>
+        <div class="recognition"><div><p class="label">KÝ HIỆU ĐANG THẤY</p><strong id="prediction">—</strong></div><div class="hold"><div><span>Tiến độ giữ tay</span><span id="progressText">0%</span></div><progress id="progress" max="1" value="0" aria-label="Tiến độ giữ ký hiệu"></progress><p>Nhả tay rồi đưa lại để nhập ký tự lặp.</p></div></div>
+      </article>
+      <article class="text-card"><div class="card-heading"><h2><span class="step">02</span> Văn bản đã ghép</h2><span id="charCount" class="state">0 ký tự</span></div>
+        <div id="output" class="output empty" role="log" aria-live="polite" aria-label="Văn bản đã ghép">Ký tự của bạn sẽ xuất hiện ở đây…</div>
+        <p id="tokens" class="tokens">Chưa có ký tự được chốt</p><p id="warnings" class="warnings" aria-live="polite"></p>
+        <div class="edit-controls"><button data-action="space">Khoảng cách</button><button data-action="backspace">⌫ Xóa token cuối</button><button data-action="clear" class="danger">Xóa hết</button></div>
+        <div class="marks"><p class="label">THÊM DẤU CHỮ <span>· hỗ trợ thủ công</span></p><div class="button-row"><button data-action="mu">Mũ <b>â ê ô đ</b></button><button data-action="moc">Móc <b>ơ ư</b></button><button data-action="trang">Trăng <b>ă</b></button></div><p class="label tone-label">THÊM DẤU THANH <span>· phím 1–5</span></p><div class="button-row tones"><button data-action="sac">Sắc <b>á</b><kbd>1</kbd></button><button data-action="huyen">Huyền <b>à</b><kbd>2</kbd></button><button data-action="hoi">Hỏi <b>ả</b><kbd>3</kbd></button><button data-action="nga">Ngã <b>ã</b><kbd>4</kbd></button><button data-action="nang">Nặng <b>ạ</b><kbd>5</kbd></button></div><p id="toneMode" class="helper"></p></div>
+        <div class="read-controls"><button id="speak" class="primary" disabled>◖)) Đọc thành tiếng</button><button id="copy" class="secondary" disabled>Sao chép</button><button id="cancelSpeech" class="secondary" disabled>Dừng đọc</button></div><p class="speech-note">Giọng Việt trực tuyến gửi văn bản tới Microsoft khi bạn nhấn Đọc. Âm thanh phát trên thiết bị của bạn.</p>
+      </article>
+    </section>
+    <section class="guide"><div><span class="guide-number">1</span><h3>Cho phép camera</h3><p>Web dùng camera của thiết bị đang mở link. Không thu âm.</p></div><div><span class="guide-number">2</span><h3>Giữ tay, chốt chữ</h3><p>Giữ hình tay ổn định. Dấu mũ, móc, trăng theo quy ước nhóm.</p></div><div><span class="guide-number">3</span><h3>Thêm dấu, rồi nghe</h3><p>Vẽ dấu thanh khoảng 2 giây hoặc dùng nút dự phòng; nghe phần ký tự đã ghép.</p></div></section>
+    <details><summary>Phạm vi thử nghiệm & cách dùng dấu</summary><div class="details-body"><p>Chữ nền được mở rộng từ bảng chữ cái ASL. Hình tay dấu chữ và cử chỉ dấu thanh là quy ước của nhóm, chưa phải bộ nhận diện ngôn ngữ ký hiệu tiếng Việt chuẩn.</p><p>Ví dụ: nhận <b>o</b> → dấu <b>mũ</b> → dấu <b>sắc</b> để ghép <b>ố</b>; <b>d</b> + <b>mũ</b> thành <b>đ</b>. Muốn sửa dấu đã thêm, xóa token dấu cũ rồi chọn dấu mới. Xóa token cuối có thể chỉ xóa dấu, tùy token cuối cùng.</p><p>Dấu thanh bằng cử chỉ còn hạn chế khi đổi người dùng; J/Z và tay trái có thể khó nhận. Việc ghép ký tự vào văn bản và đọc văn bản không đồng nghĩa mô hình nhận diện được câu.</p><p>Khung hình được gửi tới máy chủ local để xử lý, không lưu ảnh hay clip. Văn bản chỉ giữ trong bộ nhớ của phiên; tải lại trang sẽ bắt đầu phiên mới.</p></div></details>
+    <footer><span>chạm chữ / Bản thử nghiệm ký tự tiếng Việt</span><span>Nhìn thấy cử chỉ. Ghép nên con chữ.</span></footer>
+  </main>
+</body></html>

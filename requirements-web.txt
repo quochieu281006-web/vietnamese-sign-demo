@@ -1,0 +1,9 @@
+# Lightweight runtime for the web's existing landmark models (no TensorFlow).
+# On the current PC, the project's repaired .venv already has these packages.
+numpy==1.26.4
+opencv-contrib-python==4.11.0.86
+mediapipe==0.10.21
+scikit-learn==1.9.1
+joblib==1.6.0
+Pillow>=10,<13
+edge-tts==7.3.1
